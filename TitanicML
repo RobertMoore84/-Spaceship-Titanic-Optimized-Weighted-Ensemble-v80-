@@ -1,0 +1,201 @@
+# ============================================================
+#  SPACESHIP TITANIC — Optimized Weighted Ensemble (v80)
+#  Author: Rob Moore
+#  Description:
+#      Clean and reproducible machine learning pipeline for the
+#      Kaggle "Spaceship Titanic" classification challenge.
+#      Uses a Gradient Boosting + Logistic Regression ensemble
+#      with ROC-AUC-based weight tuning and threshold calibration.
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ------------------------------------------------------------
+# 1. Load Data
+# ------------------------------------------------------------
+# Update these paths as needed if running locally
+train = pd.read_csv("path_to_data/train.csv")
+test = pd.read_csv("path_to_data/test.csv")
+
+# Copy train for transformations
+df = train.copy()
+
+# Convert target variable (True/False) to 0/1
+df["Transported"] = df["Transported"].astype(int)
+y = df["Transported"]
+
+# ------------------------------------------------------------
+# 2. Feature Engineering
+# ------------------------------------------------------------
+
+# Split the Cabin field into Deck / Number / Side
+df[["CabinDeck", "CabinNum", "CabinSide"]] = df["Cabin"].astype(str).str.split("/", expand=True)
+test[["CabinDeck", "CabinNum", "CabinSide"]] = test["Cabin"].astype(str).str.split("/", expand=True)
+
+# Convert CabinNum to numeric for spatial context
+df["CabinNum"] = pd.to_numeric(df["CabinNum"], errors="coerce")
+test["CabinNum"] = pd.to_numeric(test["CabinNum"], errors="coerce")
+
+# Fill missing categorical values with mode (most common)
+for col in ["HomePlanet", "CryoSleep", "Destination", "VIP", "CabinDeck", "CabinSide"]:
+    df[col] = df[col].fillna(df[col].mode()[0])
+    test[col] = test[col].fillna(df[col].mode()[0])
+
+# Fill missing numeric features with median
+for col in ["Age", "RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"]:
+    df[col] = df[col].fillna(df[col].median())
+    test[col] = test[col].fillna(df[col].median())
+
+# Spending behaviour features
+df["TotalSpend"] = df[["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"]].sum(axis=1)
+test["TotalSpend"] = test[["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"]].sum(axis=1)
+
+# Spending relative to passenger age
+df["SpendPerAge"] = df["TotalSpend"] / (df["Age"] + 1)
+test["SpendPerAge"] = test["TotalSpend"] / (test["Age"] + 1)
+
+# Log transformation for skewed spending distributions
+df["LogSpend"] = np.log1p(df["TotalSpend"])
+test["LogSpend"] = np.log1p(test["TotalSpend"])
+
+# Encode categorical variables
+cat_cols = ["HomePlanet", "Destination", "CabinDeck", "CabinSide"]
+le_map = {}
+for col in cat_cols:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col])
+    test[col] = le.transform(test[col])
+    le_map[col] = le
+
+# Convert binary flags to integer (CryoSleep, VIP)
+df["CryoSleep"] = df["CryoSleep"].astype(int)
+df["VIP"] = df["VIP"].astype(int)
+test["CryoSleep"] = test["CryoSleep"].astype(int)
+test["VIP"] = test["VIP"].astype(int)
+
+# Group-level features derived from PassengerId
+df["GroupID"] = df["PassengerId"].str.split("_").str[0]
+test["GroupID"] = test["PassengerId"].str.split("_").str[0]
+
+df["GroupSize"] = df.groupby("GroupID")["PassengerId"].transform("count")
+test["GroupSize"] = test.groupby("GroupID")["PassengerId"].transform("count")
+
+# Whether a passenger was travelling alone
+df["IsSolo"] = (df["GroupSize"] == 1).astype(int)
+test["IsSolo"] = (test["GroupSize"] == 1).astype(int)
+
+# Final list of predictive features
+features = [
+    "HomePlanet", "CryoSleep", "Destination", "Age", "VIP",
+    "RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck",
+    "TotalSpend", "SpendPerAge", "LogSpend",
+    "CabinDeck", "CabinNum", "CabinSide",
+    "GroupSize", "IsSolo"
+]
+
+# ------------------------------------------------------------
+# 3. Clean Remaining NaNs & Train/Validation Split
+# ------------------------------------------------------------
+X = df[features].copy()
+X = X.fillna(X.median(numeric_only=True)).fillna(0)
+print("Remaining NaNs in training features:", X.isna().sum().sum())
+
+# Stratified split preserves class ratio for Transported
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ------------------------------------------------------------
+# 4. Model Training
+# ------------------------------------------------------------
+# Gradient Boosting: captures nonlinear relationships
+gb = GradientBoostingClassifier(
+    n_estimators=500,
+    learning_rate=0.04,
+    max_depth=3,
+    subsample=0.8,
+    random_state=42,
+)
+gb.fit(X_train, y_train)
+
+# Calibrate probabilities for better ensemble blending
+calibrated_gb = CalibratedClassifierCV(gb, method="isotonic", cv=5)
+calibrated_gb.fit(X_train, y_train)
+
+# Logistic Regression: robust, interpretable baseline
+logit = LogisticRegression(max_iter=1000)
+logit.fit(X_train, y_train)
+
+# ------------------------------------------------------------
+# 5. Optimize Ensemble Blend Weight
+# ------------------------------------------------------------
+# Blend two models based on validation ROC-AUC
+probs_gb = calibrated_gb.predict_proba(X_val)[:, 1]
+probs_lr = logit.predict_proba(X_val)[:, 1]
+
+best_auc = 0
+best_w = 0
+
+# Test blend weights between 0.0 (LR only) and 1.0 (GB only)
+for w in np.linspace(0, 1, 21):
+    combo = (w * probs_gb) + ((1 - w) * probs_lr)
+    auc = roc_auc_score(y_val, combo)
+    if auc > best_auc:
+        best_auc = auc
+        best_w = w
+
+optimal_w = best_w
+print(f"\nBest blend weight for GB: {optimal_w:.2f}, ROC-AUC: {best_auc:.4f}")
+
+# ------------------------------------------------------------
+# 6. Find Optimal Classification Threshold
+# ------------------------------------------------------------
+probs = (optimal_w * probs_gb) + ((1 - optimal_w) * probs_lr)
+
+best_acc = 0
+best_thresh = 0
+for t in np.linspace(0.3, 0.7, 81):
+    preds = (probs >= t).astype(int)
+    acc = accuracy_score(y_val, preds)
+    if acc > best_acc:
+        best_acc = acc
+        best_thresh = t
+
+print(f"Optimal Threshold: {best_thresh:.3f}")
+print(f"Best Accuracy: {best_acc:.4f}")
+print(f"Final ROC-AUC: {roc_auc_score(y_val, probs):.4f}")
+
+# ------------------------------------------------------------
+# 7. Generate Predictions for Submission
+# ------------------------------------------------------------
+X_test = test[features].copy()
+X_test = X_test.fillna(X_test.median(numeric_only=True)).fillna(0)
+
+# Ensemble prediction
+probs_gb_test = calibrated_gb.predict_proba(X_test)[:, 1]
+probs_lr_test = logit.predict_proba(X_test)[:, 1]
+test_probs = (optimal_w * probs_gb_test) + ((1 - optimal_w) * probs_lr_test)
+
+# Apply tuned threshold — Kaggle expects boolean output
+test_pred = (test_probs >= best_thresh).astype(bool)
+
+# Prepare final submission
+submission = pd.DataFrame({
+    "PassengerId": test["PassengerId"],
+    "Transported": test_pred
+})
+
+# Save output file
+submission.to_csv("spaceship_submission.csv", index=False)
+print("\nSubmission file created: spaceship_submission.csv")
+print(submission.head())
